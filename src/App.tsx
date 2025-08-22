@@ -244,6 +244,18 @@ function App(): ReactElement {
         try {
           const healthData = await response.json()
           addDebugLog(`API health data: ${JSON.stringify(healthData)}`)
+          
+          // Store backend capabilities from health check
+          if (healthData.voice_support !== undefined) {
+            setSpeechSupported(healthData.voice_support)
+            addDebugLog(`Voice support: ${healthData.voice_support}`)
+          }
+          if (healthData.video_response_support !== undefined) {
+            addDebugLog(`Video response support: ${healthData.video_response_support}`)
+          }
+          if (healthData.live_avatar_support !== undefined) {
+            addDebugLog(`Live avatar support: ${healthData.live_avatar_support}`)
+          }
         } catch (e) {
           addDebugLog("API responded OK but no JSON data")
         }
@@ -433,11 +445,25 @@ function App(): ReactElement {
 
     try {
       const endpoint = isVoiceInput ? `${apiBaseUrl}/ask_voice_question` : `${apiBaseUrl}/ask_question`
-      const payload = {
-        session_id: sessionId,
-        question: question,
-        generate_video_response: true
+      
+      let payload
+      if (isVoiceInput) {
+        payload = {
+          session_id: sessionId,
+          question: question,
+          confidence: 0.85, // Default confidence for voice input
+          generate_video_response: true
+        }
+      } else {
+        payload = {
+          session_id: sessionId,
+          question: question,
+          is_voice_input: false,
+          generate_video_response: true
+        }
       }
+
+      addDebugLog(`Sending question to ${endpoint}: ${JSON.stringify(payload)}`)
 
       const response = await fetch(endpoint, {
         method: "POST",
@@ -519,6 +545,34 @@ function App(): ReactElement {
       setActiveTab("customize")
     }
   }, [processingStatus, workflowStep])
+
+  // Cleanup session when component unmounts or user navigates away
+  useEffect(() => {
+    const cleanup = async () => {
+      if (sessionId && apiBaseUrl) {
+        try {
+          await fetch(`${apiBaseUrl}/cleanup_session/${sessionId}`, {
+            method: 'POST'
+          })
+          addDebugLog(`Session ${sessionId} cleaned up`)
+        } catch (error) {
+          addDebugLog(`Failed to cleanup session: ${error}`)
+        }
+      }
+    }
+
+    // Cleanup on page unload
+    const handleBeforeUnload = () => {
+      cleanup()
+    }
+
+    window.addEventListener('beforeunload', handleBeforeUnload)
+    
+    return () => {
+      window.removeEventListener('beforeunload', handleBeforeUnload)
+      cleanup()
+    }
+  }, [sessionId, apiBaseUrl])
 
   const handleFileUpload = async (files: File[]) => {
     if (files.length === 0) return
@@ -632,8 +686,11 @@ function App(): ReactElement {
     const files = e.dataTransfer.files
     if (files.length > 0) {
       const file = files[0]
-      if (file.type.includes("presentation") || file.name.endsWith(".ppt") || file.name.endsWith(".pptx")) {
+      if (file.type === "application/pdf" || file.name.endsWith(".pdf")) {
         handleFileUpload([file])
+      } else {
+        alert("Please upload a PDF file only.")
+        addDebugLog(`Invalid file type: ${file.type}, name: ${file.name}`)
       }
     }
   }
@@ -1103,7 +1160,7 @@ function App(): ReactElement {
                   </span>
                 </h1> */}
                 <p className="text-xl text-slate-600 leading-relaxed max-w-3xl mx-auto">
-                  Upload your PowerPoint and watch our AI avatar deliver it with professional excellence. 
+                  Upload your PDF presentation and watch our AI avatar deliver it with professional excellence. 
                 </p>
 
                 {/* Feature Pills
@@ -1168,7 +1225,7 @@ function App(): ReactElement {
                         <div>
                           <h3 className="text-2xl font-semibold text-slate-900 mb-2">Upload Your Presentation</h3>
                           <p className="text-slate-600 mb-6">
-                            Drag and drop your PowerPoint file here, or click to browse
+                            Drag and drop your PDF file here, or click to browse
                           </p>
                           <Button
                             onClick={() => fileInputRef.current?.click()}
@@ -1181,7 +1238,7 @@ function App(): ReactElement {
                           <input
                             ref={fileInputRef}
                             type="file"
-                            accept=".ppt,.pptx,application/vnd.ms-powerpoint,application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                            accept=".pdf,application/pdf"
                             onChange={handleFileInputChange}
                             className="hidden"
                           />
