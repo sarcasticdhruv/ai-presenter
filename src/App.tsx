@@ -66,6 +66,18 @@ function App(): ReactElement {
   const [recognition, setRecognition] = useState<any>(null)
   const [speechSupported, setSpeechSupported] = useState(false)
   
+  // Debug state for development
+  const [showDebugConsole, setShowDebugConsole] = useState(false)
+  const [debugLogs, setDebugLogs] = useState<string[]>([])
+
+  // Add debug logging function
+  const addDebugLog = (message: string) => {
+    const timestamp = new Date().toLocaleTimeString()
+    const logMessage = `[${timestamp}] ${message}`
+    setDebugLogs(prev => [...prev.slice(-49), logMessage]) // Keep last 50 logs
+    console.log(logMessage)
+  }
+
   // Navigation and Configuration State
   const [showNavMenu, setShowNavMenu] = useState(false)
   const [currentView, setCurrentView] = useState<'main' | 'presentations' | 'config'>('main')
@@ -214,9 +226,32 @@ function App(): ReactElement {
 
   const checkApiConnection = async (url: string) => {
     try {
-      const response = await fetch(`${url}/health`)
+      addDebugLog(`Checking API connection to: ${url}`)
+      const response = await fetch(`${url}/health`, {
+        method: 'GET',
+        headers: {
+          'Accept': 'application/json',
+          'Content-Type': 'application/json'
+        },
+        // Add timeout
+        signal: AbortSignal.timeout(10000) // 10 second timeout
+      })
+      
+      addDebugLog(`API health check response: ${response.status} ${response.statusText}`)
       setIsApiConnected(response.ok)
+      
+      if (response.ok) {
+        try {
+          const healthData = await response.json()
+          addDebugLog(`API health data: ${JSON.stringify(healthData)}`)
+        } catch (e) {
+          addDebugLog("API responded OK but no JSON data")
+        }
+      } else {
+        addDebugLog(`API health check failed: ${response.status}`)
+      }
     } catch (error) {
+      addDebugLog(`API connection error: ${error}`)
       setIsApiConnected(false)
     }
   }
@@ -234,86 +269,152 @@ function App(): ReactElement {
 
   const generatePresentationFromBackend = async () => {
     if (!apiBaseUrl) {
+      addDebugLog("ERROR: No API URL configured")
       alert("Please set and connect to the API URL first.")
       return
     }
     if (!uploadedFile) {
-      alert("Please select a PDF file first.")
+      addDebugLog("ERROR: No file selected")
+      alert("Please select a presentation file first.")
       return
     }
 
+    addDebugLog(`Starting presentation generation with file: ${uploadedFile.name} (${(uploadedFile.size / 1024 / 1024).toFixed(2)}MB)`)
     setProcessingStatus("processing")
     setWorkflowStep("processing")
 
     const formData = new FormData()
     formData.append("presentation_deck", uploadedFile)
+    addDebugLog(`FormData created with file: ${uploadedFile.type}`)
 
     try {
+      addDebugLog(`Sending POST request to: ${apiBaseUrl}/start_generation/`)
+      
+      // Add headers for better compatibility
       const response = await fetch(`${apiBaseUrl}/start_generation/`, {
         method: "POST",
         body: formData,
+        headers: {
+          'Accept': 'application/json',
+        }
       })
 
+      addDebugLog(`Response received: ${response.status} ${response.statusText}`)
+
       if (!response.ok) {
-        const errData = await response.json()
-        throw new Error(errData.detail || "Failed to start generation.")
+        let errorMessage = "Failed to start generation."
+        try {
+          const errData = await response.json()
+          errorMessage = errData.detail || errData.message || errorMessage
+          addDebugLog(`Error data: ${JSON.stringify(errData)}`)
+        } catch {
+          errorMessage = `HTTP ${response.status}: ${response.statusText}`
+          addDebugLog(`No JSON error data, using status: ${errorMessage}`)
+        }
+        throw new Error(errorMessage)
       }
 
       const initialData = await response.json()
+      addDebugLog(`Backend response: ${JSON.stringify(initialData, null, 2)}`)
+      
       if (!initialData.slides || initialData.slides.length === 0) {
-        alert("The PDF could not be processed or contains no slides.")
+        addDebugLog("ERROR: No slides in response")
+        alert("The presentation could not be processed or contains no slides.")
         setProcessingStatus("error")
         return
       }
 
+      addDebugLog(`Received ${initialData.slides.length} slides, session ID: ${initialData.session_id}`)
       setSessionId(initialData.session_id)
       setPresentationData(initialData)
       
       // Convert backend data to our format
-      setExtractedSlides(initialData.slides.map((slide: any) => ({
+      const convertedSlides = initialData.slides.map((slide: any) => ({
         id: slide.id,
         title: slide.title || `Slide ${slide.id}`,
         content: slide.content || "",
         thumbnail: `${apiBaseUrl}${slide.image_url}`,
-      })))
+      }))
+      
+      addDebugLog(`Converted slides: ${JSON.stringify(convertedSlides, null, 2)}`)
+      setExtractedSlides(convertedSlides)
 
       // Start polling for status
+      addDebugLog(`Starting status polling for session: ${initialData.session_id}`)
       pollGenerationStatus(initialData.session_id)
 
     } catch (error) {
-      console.error("Error:", error)
-      alert(`Error generating presentation: ${error instanceof Error ? error.message : 'Unknown error'}`)
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred'
+      addDebugLog(`ERROR in generatePresentationFromBackend: ${errorMessage}`)
+      console.error("Error generating presentation:", error)
+      alert(`Error generating presentation: ${errorMessage}`)
       setProcessingStatus("error")
     }
   }
 
   const pollGenerationStatus = (sessionId: string) => {
+    let pollCount = 0
+    const maxPolls = 300 // 5 minutes max (300 seconds / 1 second interval)
+    
+    addDebugLog(`Starting polling for session: ${sessionId}`)
+    
     const pollInterval = setInterval(async () => {
+      pollCount++
+      
+      if (pollCount > maxPolls) {
+        addDebugLog(`ERROR: Polling timeout reached after ${maxPolls} attempts`)
+        clearInterval(pollInterval)
+        setProcessingStatus("error")
+        alert("Generation is taking longer than expected. Please check your backend connection.")
+        return
+      }
+
       try {
-        const response = await fetch(`${apiBaseUrl}/generation_status/${sessionId}`)
-        if (!response.ok) return
+        addDebugLog(`Polling attempt ${pollCount}/${maxPolls} for session ${sessionId}`)
+        
+        const response = await fetch(`${apiBaseUrl}/generation_status/${sessionId}`, {
+          headers: {
+            'Accept': 'application/json',
+          }
+        })
+        
+        if (!response.ok) {
+          addDebugLog(`Polling failed with status: ${response.status} ${response.statusText}`)
+          return
+        }
 
         const statusData = await response.json()
+        addDebugLog(`Status response: ${JSON.stringify(statusData)}`)
         
         // Update processing status based on backend response
         if (statusData.status === "Completed") {
+          addDebugLog("🎉 Generation completed successfully!")
           setProcessingStatus("complete")
           setWorkflowStep("customize")
           setPresentationData((prev: any) => ({ ...prev, videos: statusData.videos }))
           clearInterval(pollInterval)
-        } else if (statusData.status === "Error") {
+        } else if (statusData.status === "Error" || statusData.status === "Failed") {
+          const errorMsg = statusData.error || "Unknown error"
+          addDebugLog(`❌ Generation failed: ${errorMsg}`)
           setProcessingStatus("error")
           clearInterval(pollInterval)
+          alert(`Generation failed: ${errorMsg}`)
         } else {
           // Update videos as they complete
+          addDebugLog(`⏳ Generation in progress: ${statusData.status}`)
+          if (statusData.videos && statusData.videos.length > 0) {
+            addDebugLog(`📹 Videos available: ${statusData.videos.length}`)
+          }
           setPresentationData((prev: any) => ({ ...prev, videos: statusData.videos || [] }))
         }
       } catch (error) {
-        console.error("Polling error:", error)
-        clearInterval(pollInterval)
-        setProcessingStatus("error")
+        addDebugLog(`⚠️ Polling error: ${error}`)
+        // Don't clear interval on single errors, but log them
+        if (pollCount % 10 === 0) { // Every 10 attempts, show a warning
+          addDebugLog(`⚠️ Polling has failed ${pollCount} times. Still trying...`)
+        }
       }
-    }, 1000) // Faster polling - every 1 second instead of 3
+    }, 1000) // Poll every 1 second
   }
 
   const sendQuestion = async (question: string, isVoiceInput = false) => {
@@ -624,6 +725,43 @@ function App(): ReactElement {
     setActiveTab("present")
   }
 
+  // Settings management
+  const updateSettings = (key: string, value: any) => {
+    setSettings(prev => ({
+      ...prev,
+      [key]: value
+    }))
+    // Save to localStorage
+    localStorage.setItem('ai-presenter-settings', JSON.stringify({
+      ...settings,
+      [key]: value
+    }))
+  }
+
+  // Load settings from localStorage on mount
+  useEffect(() => {
+    const savedSettings = localStorage.getItem('ai-presenter-settings')
+    if (savedSettings) {
+      try {
+        const parsed = JSON.parse(savedSettings)
+        setSettings(prev => ({ ...prev, ...parsed }))
+      } catch (error) {
+        console.error('Failed to load settings:', error)
+      }
+    }
+  }, [])
+
+  // Timer functionality
+  useEffect(() => {
+    let interval: number
+    if (isVideoPlaying) {
+      interval = setInterval(() => {
+        setCurrentTime(prev => prev + 1)
+      }, 1000)
+    }
+    return () => clearInterval(interval)
+  }, [isVideoPlaying])
+
   const formatTime = (seconds: number) => {
     const mins = Math.floor(seconds / 60)
     const secs = seconds % 60
@@ -660,6 +798,64 @@ function App(): ReactElement {
     }
   }
 
+  const exportPresentation = async (format: 'pdf' | 'video' | 'images') => {
+    if (!apiBaseUrl || !sessionId) {
+      alert('Please ensure you have a generated presentation and backend connection.')
+      return
+    }
+
+    try {
+      const response = await fetch(`${apiBaseUrl}/export_presentation/${sessionId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ format, include_videos: true })
+      })
+
+      if (response.ok) {
+        const blob = await response.blob()
+        const url = window.URL.createObjectURL(blob)
+        const a = document.createElement('a')
+        a.href = url
+        a.download = `presentation.${format === 'images' ? 'zip' : format}`
+        document.body.appendChild(a)
+        a.click()
+        window.URL.revokeObjectURL(url)
+        document.body.removeChild(a)
+      } else {
+        alert('Export failed. Please try again.')
+      }
+    } catch (error) {
+      console.error('Export error:', error)
+      alert('Export failed. Please check your connection.')
+    }
+  }
+
+  const sharePresentation = async () => {
+    if (!apiBaseUrl || !sessionId) {
+      alert('Please ensure you have a generated presentation.')
+      return
+    }
+
+    try {
+      const response = await fetch(`${apiBaseUrl}/share_presentation/${sessionId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ public: true, expires_in: '7d' })
+      })
+
+      if (response.ok) {
+        const data = await response.json()
+        navigator.clipboard.writeText(data.share_url)
+        alert('Share link copied to clipboard!')
+      } else {
+        alert('Failed to create share link.')
+      }
+    } catch (error) {
+      console.error('Share error:', error)
+      alert('Failed to create share link.')
+    }
+  }
+
   const loadSlideVideo = (slideIndex: number) => {
     if (presentationData?.videos) {
       const slide = extractedSlides[slideIndex - 1]
@@ -675,7 +871,33 @@ function App(): ReactElement {
 
   useEffect(() => {
     loadSlideVideo(currentSlide)
-  }, [currentSlide, presentationData])
+    
+    // Add event listeners to video elements to sync play/pause state
+    const videos = document.querySelectorAll('video')
+    
+    const handlePlay = () => setIsVideoPlaying(true)
+    const handlePause = () => setIsVideoPlaying(false)
+    const handleEnded = () => {
+      setIsVideoPlaying(false)
+      if (settings.autoAdvanceSlides && currentSlide < extractedSlides.length) {
+        setTimeout(() => nextSlide(), 1000)
+      }
+    }
+    
+    videos.forEach(video => {
+      video.addEventListener('play', handlePlay)
+      video.addEventListener('pause', handlePause)
+      video.addEventListener('ended', handleEnded)
+    })
+    
+    return () => {
+      videos.forEach(video => {
+        video.removeEventListener('play', handlePlay)
+        video.removeEventListener('pause', handlePause)
+        video.removeEventListener('ended', handleEnded)
+      })
+    }
+  }, [currentSlide, presentationData, settings.autoAdvanceSlides, extractedSlides.length])
 
   // Listen for fullscreen changes
   useEffect(() => {
@@ -764,6 +986,18 @@ function App(): ReactElement {
               <Button variant="outline" size="sm" className="rounded-lg px-4 py-2 border-slate-200 text-slate-600 hover:bg-slate-50">
                 <HelpCircle className="w-4 h-4 mr-2" />
                 Help
+              </Button>
+
+              {/* Debug Console Toggle - Development Only */}
+              <Button 
+                variant="outline" 
+                size="sm" 
+                onClick={() => setShowDebugConsole(!showDebugConsole)}
+                className="rounded-lg px-4 py-2 border-slate-200 text-slate-600 hover:bg-slate-50"
+                title="Toggle Debug Console"
+              >
+                <Settings className="w-4 h-4 mr-2" />
+                Debug
               </Button>
 
               <Avatar className="w-8 h-8 border-2 border-slate-200">
@@ -1272,12 +1506,14 @@ function App(): ReactElement {
                         variant="ghost"
                         size="sm"
                         onClick={() => {
-                          const video = document.querySelector('video')
+                          const video = document.querySelector('video') as HTMLVideoElement
                           if (video) {
                             if (video.paused) {
                               video.play()
+                              setIsVideoPlaying(true)
                             } else {
                               video.pause()
+                              setIsVideoPlaying(false)
                             }
                           }
                         }}
@@ -1317,12 +1553,14 @@ function App(): ReactElement {
                           variant={isVideoPlaying ? "default" : "outline"}
                           size="lg"
                           onClick={() => {
-                            const video = document.querySelector('video')
+                            const video = document.querySelector('video') as HTMLVideoElement
                             if (video) {
                               if (video.paused) {
                                 video.play()
+                                setIsVideoPlaying(true)
                               } else {
                                 video.pause()
+                                setIsVideoPlaying(false)
                               }
                             }
                           }}
@@ -1368,6 +1606,7 @@ function App(): ReactElement {
                         <Button
                           variant="outline"
                           size="lg"
+                          onClick={() => exportPresentation('pdf')}
                           className="bg-purple-600 hover:bg-purple-700 text-white border-none rounded-lg"
                         >
                           <Download className="w-4 h-4 mr-2" />
@@ -1423,7 +1662,7 @@ function App(): ReactElement {
                         <Button
                           variant="ghost"
                           size="sm"
-                          onClick={() => setSettings(prev => ({...prev, autoAdvanceSlides: !prev.autoAdvanceSlides}))}
+                          onClick={() => updateSettings('autoAdvanceSlides', !settings.autoAdvanceSlides)}
                           className={`text-xs ${settings.autoAdvanceSlides ? 'bg-blue-100 text-blue-700' : 'text-slate-600'}`}
                         >
                           Auto-advance: {settings.autoAdvanceSlides ? 'ON' : 'OFF'}
@@ -1431,7 +1670,7 @@ function App(): ReactElement {
                         <Button
                           variant="ghost"
                           size="sm"
-                          onClick={() => setSettings(prev => ({...prev, showSlideNumbers: !prev.showSlideNumbers}))}
+                          onClick={() => updateSettings('showSlideNumbers', !settings.showSlideNumbers)}
                           className={`text-xs ${settings.showSlideNumbers ? 'bg-blue-100 text-blue-700' : 'text-slate-600'}`}
                         >
                           Numbers: {settings.showSlideNumbers ? 'ON' : 'OFF'}
@@ -1579,11 +1818,11 @@ function App(): ReactElement {
                       <MessageSquare className="w-3 h-3 mr-2" />
                       Open Q&A Panel
                     </Button>
-                    <Button variant="outline" size="sm" className="w-full justify-start text-xs">
+                    <Button variant="outline" size="sm" className="w-full justify-start text-xs" onClick={() => exportPresentation('pdf')}>
                       <Download className="w-3 h-3 mr-2" />
                       Export as PDF
                     </Button>
-                    <Button variant="outline" size="sm" className="w-full justify-start text-xs">
+                    <Button variant="outline" size="sm" className="w-full justify-start text-xs" onClick={sharePresentation}>
                       <Share className="w-3 h-3 mr-2" />
                       Share Presentation
                     </Button>
@@ -1689,6 +1928,42 @@ function App(): ReactElement {
                         Unable to connect to backend API. Please check the URL and try again.
                       </div>
                     )}
+                    
+                    {/* API Test Section */}
+                    <div className="border-t border-slate-200 pt-4">
+                      <div className="flex items-center gap-3">
+                        <Button
+                          onClick={async () => {
+                            if (!apiBaseUrl) {
+                              addDebugLog("No API URL configured for test")
+                              alert("Please enter an API URL first")
+                              return
+                            }
+                            addDebugLog(`Testing API connection to: ${apiBaseUrl}`)
+                            await checkApiConnection(apiBaseUrl)
+                          }}
+                          variant="outline"
+                          size="sm"
+                          className="flex items-center gap-2"
+                        >
+                          <Globe className="w-4 h-4" />
+                          Test Connection
+                        </Button>
+                        
+                        <Button
+                          onClick={() => {
+                            addDebugLog("Manual debug log test")
+                            addDebugLog(`Current state: API=${isApiConnected}, Session=${sessionId}, Status=${processingStatus}`)
+                          }}
+                          variant="outline"
+                          size="sm"
+                          className="flex items-center gap-2"
+                        >
+                          <Settings className="w-4 h-4" />
+                          Debug Test
+                        </Button>
+                      </div>
+                    </div>
                   </div>
                 </CardContent>
               </Card>
@@ -2097,6 +2372,42 @@ function App(): ReactElement {
           >
             <MessageSquare className="w-6 h-6" />
           </Button>
+        )}
+
+        {/* Debug Console */}
+        {showDebugConsole && (
+          <div className="fixed bottom-4 left-4 w-96 h-80 bg-black/90 backdrop-blur-sm text-white p-4 rounded-lg font-mono text-xs z-50 overflow-hidden">
+            <div className="flex justify-between items-center mb-2">
+              <span className="font-bold text-green-400">Debug Console</span>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => setShowDebugConsole(false)}
+                className="text-white hover:bg-white/20 h-6 w-6 p-0"
+              >
+                <X className="w-4 h-4" />
+              </Button>
+            </div>
+            <div className="h-64 overflow-y-auto space-y-1">
+              {debugLogs.length === 0 ? (
+                <div className="text-gray-400">No debug logs yet...</div>
+              ) : (
+                debugLogs.map((log, index) => (
+                  <div key={index} className="text-green-300 break-words">
+                    {log}
+                  </div>
+                ))
+              )}
+            </div>
+            <div className="mt-2 pt-2 border-t border-gray-600 text-xs">
+              <div className="grid grid-cols-2 gap-2 text-gray-300">
+                <div>API: {isApiConnected ? '✅' : '❌'}</div>
+                <div>Session: {sessionId ? '✅' : '❌'}</div>
+                <div>Status: {processingStatus}</div>
+                <div>Slides: {extractedSlides.length}</div>
+              </div>
+            </div>
+          </div>
         )}
       </div>
     </div>
